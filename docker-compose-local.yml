@@ -1,0 +1,245 @@
+version: '3.7'
+name: 'project-s-light'
+services:
+
+  mqtt:
+   restart: always
+   container_name: mqtt-server
+   image: eclipse-mosquitto
+   volumes:
+      - type: bind
+        source: ./MQTT-Config/
+        target: /mosquitto/config/
+   ports:
+      - 9001:9001
+      - 1883:1883
+
+  mongodb:
+    restart: always
+    image: mongo:latest
+    ports:
+      - 27017:27017
+    command: --quiet
+
+  zoo1:
+    image: confluentinc/cp-zookeeper:7.5.2
+    hostname: zoo1
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      
+  broker:
+    image: confluentinc/cp-kafka:7.5.2
+    hostname: broker
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: LISTENER_DOCKER_INTERNAL://broker:19092,LISTENER_DOCKER_EXTERNAL://${DOCKER_HOST_IP:-127.0.0.1}:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: LISTENER_DOCKER_INTERNAL:PLAINTEXT,LISTENER_DOCKER_EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: LISTENER_DOCKER_INTERNAL
+      KAFKA_ZOOKEEPER_CONNECT: "zoo1:2181"
+      KAFKA_BROKER_ID: 1
+      KAFKA_LOG4J_LOGGERS: "kafka.controller=INFO,kafka.producer.async.DefaultEventHandler=INFO,state.change.logger=INFO"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    depends_on:
+      - zoo1
+
+  akhq:
+    image: tchiotludo/akhq
+    restart: always
+    ports:
+      - "9800:8080"
+    depends_on:
+      - zoo1
+      - broker
+    environment:
+      AKHQ_CONFIGURATION: |
+        akhq:
+          connections:
+            docker-kafka-server:
+              properties:
+                bootstrap.servers: "broker:19092"
+      
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.5.2
+    hostname: kafka-setup
+    container_name: kafka-setup
+    depends_on:
+      - broker
+      - zoo1
+    command: "bash -c 'echo Waiting for Kafka to be ready... && \
+                       cub kafka-ready -b broker:19092 1 20 && \
+                       kafka-topics --create --if-not-exists --bootstrap-server broker:19092 --partitions 1 --replication-factor 1 --topic explainer-lime-generate && \
+                       kafka-topics --create --if-not-exists --bootstrap-server broker:19092 --partitions 1 --replication-factor 1 --topic explainer-shap-generate && \
+                       kafka-topics --create --if-not-exists --bootstrap-server broker:19092 --partitions 1 --replication-factor 1 --topic explainer-anchors-generate && \
+                       kafka-topics --create --if-not-exists --bootstrap-server broker:19092 --partitions 1 --replication-factor 1 --topic explainer-lime-visualization && \
+                       kafka-topics --create --if-not-exists --bootstrap-server broker:19092 --partitions 1 --replication-factor 1 --topic explainer-shap-visualization && \
+                       kafka-topics --create --if-not-exists --bootstrap-server broker:19092 --partitions 1 --replication-factor 1 --topic explainer-anchors-visualization && \
+                       kafka-topics --create --if-not-exists --bootstrap-server broker:19092 --partitions 1 --replication-factor 1 --topic logs && \
+                       kafka-topics --create --if-not-exists --bootstrap-server broker:19092 --partitions 1 --replication-factor 1 --topic preprocessing
+                       '"
+    environment:
+      KAFKA_BROKER_ID: ignored
+      KAFKA_ZOOKEEPER_CONNECT: ignored
+      
+  s-dashboard:
+    container_name: s-dashboard
+    build:
+      context: .
+      dockerfile: ./Dashboard/Dockerfile.prod
+      args:
+        REACT_APP_API_GATEWAY: "http://localhost"
+        REACT_APP_MQTT_SERVER: "ws://localhost:9001"
+    ports:
+      - 3000:80
+
+  api-gateway:
+    container_name: api-gateway
+    build:
+      context: .
+      dockerfile: ./APIGateway/Dockerfile
+    ports:
+      - 8080:8080
+    environment:
+      KAFKA_BOOTSTRAP: "broker:19092"
+      KAFKA_GROUP_ID: "test"
+      MONGODB_URI: "mongodb://mongodb:27017/explainer"
+      MONGODB_DATABASE_NAME: "explainer"
+      STARLIGHT_WEB_URL: "http://localhost:3000"
+      AI4CYBER_WEB_URL: "http://localhost:3001"
+    depends_on:
+      - mongodb
+      - broker
+      
+  litnet-simulator:
+    container_name: litnet-simulator
+    build:
+      context: .
+      dockerfile: ./litnet-simulator-stream/Dockerfile
+    volumes:
+      - "./litnet-simulator-stream/resources:/app/resources"
+    environment:
+      KAFKA_BROKER_URL_OUT: "broker:19092"
+      KAFKA_GROUP_ID: litnet
+      KAFKA_OFFSET: latest
+      KAFKA_TOPIC_OUT: sparta-test
+      FILES: "/app/resources/test_x.csv"
+      
+  lime-generate:
+    container_name: lime-generate
+    build:
+      context: .
+      dockerfile: ./xAImicroservices/LIME/LIME-Generate/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP_SERVER: "broker:19092"
+      KAFKA_GROUP_ID: "LIME_generate"
+      KAFKA_TOPIC: "explainer-lime-generate"
+      MQTT_CLIENT_ID: "lime_generate"
+      MQTT_SERVER: "mqtt"
+      MQTT_TOPIC_PUBLISH: "explainer-lime-generate-info"
+      MQTT_TOPIC_PUBLISH_ERROR: "explainer-dice-generate-error"
+      MQTT_PORT: "1883"
+    depends_on:
+      - mqtt
+      
+  lime-visualization:
+    container_name: lime-visualization
+    build:
+      context: .
+      dockerfile: ./xAImicroservices/LIME/LIME-Visualization/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP_SERVER: "broker:19092"
+      KAFKA_GROUP_ID: "LIME_visualization"
+      KAFKA_TOPIC: "explainer-lime-visualization"
+      MQTT_CLIENT_ID: "lime_visualization"
+      MQTT_SERVER: "mqtt"
+      MQTT_TOPIC_PUBLISH: "explainer-lime-visualization-info"
+      MQTT_TOPIC_PUBLISH_ERROR: "explainer-dice-generate-error"
+      MQTT_PORT: "1883"
+      MQTT_WS_PORT: "9001"
+    depends_on:
+      - mqtt
+      
+  shap-generate:
+    container_name: shap-generate
+    build:
+      context: .
+      dockerfile: ./xAImicroservices/SHAP/SHAP-Generate/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP_SERVER: "broker:19092"
+      KAFKA_GROUP_ID: "SHAP_generate"
+      KAFKA_TOPIC: "explainer-shap-generate"
+      MQTT_CLIENT_ID: "shap_generate"
+      MQTT_SERVER: "mqtt"
+      MQTT_TOPIC_PUBLISH: "explainer-shap-generate-info"
+      MQTT_TOPIC_PUBLISH_ERROR: "explainer-dice-generate-error"
+      MQTT_PORT: "1883"
+    depends_on:
+      - mqtt
+      
+  shap-visualization:
+    container_name: shap-visualization
+    build:
+      context: .
+      dockerfile: ./xAImicroservices/SHAP/SHAP-Visualization/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP_SERVER: "broker:19092"
+      KAFKA_GROUP_ID: "SHAP_visualization"
+      KAFKA_TOPIC: "explainer-shap-visualization"
+      MQTT_CLIENT_ID: "shap_visualization"
+      MQTT_SERVER: "mqtt"
+      MQTT_TOPIC_PUBLISH: "explainer-shap-visualization-info"
+      MQTT_TOPIC_PUBLISH_ERROR: "explainer-dice-generate-error"
+      MQTT_PORT: "1883"
+      MQTT_WS_PORT: "9001"
+    depends_on:
+      - mqtt
+
+  anchors-generate:
+    container_name: anchors-generate
+    build:
+      context: .
+      dockerfile: ./xAImicroservices/ANCHORS/ANCHORS-Generate/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP_SERVER: "broker:19092"
+      KAFKA_GROUP_ID: "ANCHORS_generate"
+      KAFKA_TOPIC: "explainer-anchors-generate"
+      MQTT_CLIENT_ID: "anchors_generate"
+      MQTT_SERVER: "mqtt"
+      MQTT_TOPIC_PUBLISH: "explainer-anchors-generate-info"
+      MQTT_TOPIC_PUBLISH_ERROR: "explainer-anchors-generate-error"
+      MQTT_PORT: "1883"
+      MQTT_WS_PORT: "9001"
+    depends_on:
+      - mqtt
+      
+  anchors-visualization:
+    container_name: anchors-visualization
+    build:
+      context: .
+      dockerfile: ./xAImicroservices/ANCHORS/ANCHORS-Visualization/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP_SERVER: "broker:19092"
+      KAFKA_GROUP_ID: "ANCHORS_visualization"
+      KAFKA_TOPIC: "explainer-anchors-visualization"
+      MQTT_CLIENT_ID: "anchors_visualization"
+      MQTT_SERVER: "mqtt"
+      MQTT_TOPIC_PUBLISH: "explainer-anchors-visualization-info"
+      MQTT_TOPIC_PUBLISH_ERROR: "explainer-anchors-generate-error"
+      MQTT_PORT: "1883"
+      MQTT_WS_PORT: "9001"
+    depends_on:
+      - mqtt
+
+  preprocessing:
+    container_name: preprocessing
+    build:
+      context: .
+      dockerfile: ./Preprocessing/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP_SERVER: "broker:19092"
+      KAFKA_GROUP_ID: "preprocessing"
+      KAFKA_TOPIC: "preprocessing"
+    depends_on:
+      - mqtt

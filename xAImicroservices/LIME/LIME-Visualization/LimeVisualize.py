@@ -1,0 +1,171 @@
+import json
+import os
+import pickle
+import time
+import uuid
+import dill
+import gridfs
+import joblib
+import numpy as np
+import requests
+from bson import ObjectId
+from confluent_kafka import Producer
+import paho.mqtt.client as mqtt
+from lime.lime_text import LimeTextExplainer
+
+from DBConnection import DBConnection
+
+KAFKA_BOOTSTRAP_SERVER = os.environ.get("KAFKA_BOOTSTRAP_SERVER")
+MQTT_SERVER = os.environ.get("MQTT_SERVER")
+MQTT_WS_PORT = os.environ.get("MQTT_WS_PORT")
+
+class LimeTabularVisualize():
+
+    def __init__(self):
+        self.model = None
+        self.model_type = None
+        self.label_column = None
+        self.categorical_features = None
+        self.explainer_name = None
+        self.explainer_id = None
+        self.model_id = None
+        self.column_names = None
+        self.db = DBConnection().get_connection()['explainer']
+        self.fs = gridfs.GridFS(self.db)
+
+    def predict_probs(self, data):
+        columns = self.column_names
+        columns.remove(self.label_column)
+
+        scaled_data = self.scale_data(data.tolist(), columns, self.categorical_features, self.model_id,
+                                      self.explainer_id, self.explainer_name, "scaling")
+
+        scaled_data = np.array(scaled_data)
+
+        return self.model.predict_proba(scaled_data)
+
+    def predict(self, data):
+        columns = self.column_names
+        pre_data = self.scale_data([data], columns, self.categorical_features, self.model_id,
+                                   self.explainer_id, self.explainer_name, "scaling")
+        pre_data = np.array(pre_data)
+
+        return self.model.predict(pre_data).tolist()
+
+
+    def visualization(self, data, model_id, explainer_name, explainer_id, column_names, label_column,
+                      model_type, model_file_id):
+
+        self.label_column = label_column
+        self.column_names = column_names
+        self.model_id = model_id
+        self.explainer_id = explainer_id
+        self.explainer_name = explainer_name
+        self.model_type = model_type
+
+        fs_model_file = self.fs.get(ObjectId(model_file_id))
+        model_file_name = fs_model_file.filename
+        if model_file_name.split('.')[-1] == "h5":
+            self.model = pickle.loads(fs_model_file.read())
+        if model_file_name.split('.')[-1] == "joblib":
+            self.model = joblib.load(fs_model_file)
+
+        # preprocessing data
+        data = eval(data)
+
+        ################################################################
+        # Do przerobienia na coś ładniejszego potem
+        temp = []
+        for name in column_names:
+            temp.append(name.replace('/', '\\/'))
+        column_names = temp
+        ################################################################
+        column_names.remove(label_column)
+
+        # Categorical Features from exp
+        exp = self.db.explainer.find_one({'_id': explainer_id})
+        categorical_features = "".join(exp['categoricalFeatures']).split(",") if exp['categoricalFeatures'] else []
+        self.categorical_features = categorical_features
+
+        data = dict((k, data[k]) for k in column_names if k in data)
+        data = list(data.values())
+
+        if categorical_features:
+            data = self.scale_data([data], column_names, categorical_features, model_id, explainer_id, explainer_name,
+                                   "encoding")[0]
+
+        # reading explainer from database
+        result = self.db.fs.files.find_one({'modelId': model_id,
+                                            'explainerId': explainer_id,
+                                            'explainerName': explainer_name,
+                                            'type': "explainer"})
+
+        id = result['_id']
+        fs = gridfs.GridFS(self.db)
+        self.explainer = dill.loads(fs.get(id).read())
+
+        visualization = {
+            'visualizationData': self.explainer.explain_instance(np.array(data), self.predict_probs,
+                                                                 num_features=len(column_names)).as_list(),
+            'prediction': self.predict(data),
+        }
+
+        return visualization
+
+    def scale_data(self, data, column_names, categorical_features, model_id, explainer_id, explainer_name,
+                   target):
+
+        id = uuid.uuid4()
+
+        def on_connect(client, userdata, flags, rc):
+            if rc == 0:
+                print("connected")
+                client.subscribe("preprocessing", qos=2)
+            else:
+                print("Connection error")
+
+        def on_message(client, userdata, msg):
+            nonlocal val
+            val = msg.payload.decode()
+
+        val = None
+        client = mqtt.Client(client_id=str(id),
+                             transport='websockets')
+        client.on_connect = on_connect
+        client.on_message = on_message
+        client.connect(MQTT_SERVER, port=int(MQTT_WS_PORT))
+        client.loop_start()
+
+        producer = Producer({'bootstrap.servers': KAFKA_BOOTSTRAP_SERVER})
+        print("Producer init")
+
+        fs = gridfs.GridFS(self.db)
+        data_id = fs.put(str(data), encoding='utf-8')
+
+        kafka_data = {
+            'id': str(id),
+            'data_id': str(data_id),
+            'column_names': column_names,
+            'categorical_features': categorical_features,
+            'model_id': model_id,
+            'explainer_id': explainer_id,
+            'explainer_name': explainer_name,
+            'target': target,
+        }
+
+        m = json.dumps(kafka_data)
+        producer.poll(1)
+        producer.produce('preprocessing', m.encode('utf-8'))
+        producer.flush()
+
+        while val != str(id):
+            time.sleep(0.1)
+
+        client.loop_stop()
+        client.disconnect()
+
+        result = self.db.preprocessing.find_one({
+            'id': str(id)
+        })
+
+        return json.loads(result['data'])

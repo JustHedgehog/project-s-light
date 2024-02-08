@@ -1,0 +1,14 @@
+spring:
+  servlet:
+    multipart:
+      max-request-size: 50MB
+      max-file-size: 50MB
+
+app:
+  kafka:
+    url: ${KAFKA_BOOTSTRAP:localhost:9092}
+    groupId: ${KAFKA_GROUP_ID:test}
+  mongo:
+    url: ${MONGODB_URI:mongodb://localhost:27017/explainer}
+    database:
+      name: ${MONGODB_DATABASE_NAME:explainer}

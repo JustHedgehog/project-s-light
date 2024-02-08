@@ -1,0 +1,24 @@
+FROM node as builder
+WORKDIR /app
+ENV PATH /node_modules/.bin:$PATH
+COPY ./Dashboard/package.json ./
+COPY ./Dashboard/yarn.lock ./
+RUN yarn install --silent
+RUN yarn global add react-scripts
+COPY ./Dashboard/. ./
+
+# Set env variable
+ARG REACT_APP_API_GATEWAY
+ARG REACT_APP_MQTT_SERVER
+ENV REACT_APP_API_GATEWAY $REACT_APP_API_GATEWAY
+ENV REACT_APP_MQTT_SERVER $REACT_APP_MQTT_SERVER
+
+RUN yarn run build
+
+#PROD
+
+FROM nginx:stable-alpine
+COPY ./Dashboard/nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=builder app/build /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
