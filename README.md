@@ -31,4 +31,4 @@ docker exec -it project-s-light-mongodb-1 sh -c 'mongorestore -d explainer expla
 Once the setup is complete you can access the dashboard via 
 http://localhost:3000/
 
-
+Please note that some explanations might take time to create
